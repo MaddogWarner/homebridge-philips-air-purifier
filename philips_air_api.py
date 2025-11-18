@@ -3,6 +3,8 @@ import asyncio
 import json
 import sys
 from typing import Dict, Any, Optional
+
+from aiocoap.error import NetworkError
 from aioairctrl.coap.client import Client
 
 
@@ -28,7 +30,23 @@ class PhilipsAirPurifier:
         self.max_retries = max_retries
     
     async def connect(self):
-        self._client = await Client.create(self.host, self.port)
+        if self._client:
+            return
+        
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                self._client = await Client.create(self.host, self.port)
+                return
+            except (OSError, NetworkError, asyncio.TimeoutError) as e:
+                last_error = e
+                self._client = None
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                raise ConnectionError(
+                    f"Failed to connect to purifier at {self.host}:{self.port}: {e}"
+                ) from e
     
     async def disconnect(self):
         if self._client:
@@ -44,9 +62,14 @@ class PhilipsAirPurifier:
             try:
                 status, max_age = await self._client.get_status()
                 return status
-            except (ValueError, Exception) as e:
+            except Exception as e:
                 error_msg = str(e)
-                if "non-hexadecimal" in error_msg or "decrypt" in error_msg.lower():
+                is_retryable = (
+                    isinstance(e, json.JSONDecodeError)
+                    or "non-hexadecimal" in error_msg
+                    or "decrypt" in error_msg.lower()
+                )
+                if is_retryable:
                     last_error = e
                     if attempt < self.max_retries - 1:
                         await self.disconnect()
@@ -236,7 +259,9 @@ async def handle_command(host: str, command: str, *args):
             return 1
         
         return 0
-        
+    except ConnectionError as e:
+        print(f"Failed to connect to purifier at {host}:{purifier.port} - {e}", file=sys.stderr)
+        return 1
     finally:
         await purifier.disconnect()
 
