@@ -8,7 +8,9 @@ Control your Philips Air Purifier with HomeKit via Homebridge.
 - ✅ **4 Ventilation Modes** - Auto, Sleep, Medium, Turbo
 - ✅ **Air Quality Sensor** - Real-time PM2.5 readings
 - ✅ **Display Light Control** - Control brightness (Off, Dim, Bright)
+- ✅ **Child Lock** - Lock/unlock physical controls
 - ✅ **HomeKit Native** - Full integration with Apple Home app
+- ✅ **Real-time Updates** - Uses CoAP Observe for push updates from device
 
 ## Prerequisites
 
@@ -21,41 +23,34 @@ Control your Philips Air Purifier with HomeKit via Homebridge.
 ### Step 1: Install Python Dependencies
 
 ```bash
-# If using a virtual environment (recommended)
-python3 -m venv ~/philips-air-venv
-source ~/philips-air-venv/bin/activate  # On macOS/Linux
-# or
-~/philips-air-venv/Scripts/activate  # On Windows
+# Install aioairctrl (system-wide or in a virtual environment)
+pip3 install aioairctrl
 
-# Install aioairctrl
+# Or using a virtual environment (recommended)
+python3 -m venv ~/philips-air-venv
+source ~/philips-air-venv/bin/activate
 pip install aioairctrl
 ```
 
 ### Step 2: Preflight Check (connectivity)
 
-After installing the plugin, you can test connectivity. The plugin will automatically use the bundled Python script, but you can test manually:
+Test connectivity to your device:
 
 ```bash
-# Find the plugin directory (usually in Homebridge's node_modules)
-# Then test connectivity:
-AIOCOAP_CLIENT_TRANSPORT=udp4 python3 <plugin-dir>/philips_air_api.py <device-ip> sensors
+python3 <plugin-dir>/philips_air_api.py <device-ip> sensors
 ```
 
-You should see a JSON payload. If you get pktinfo/decrypt errors, re-run; these are often transient. The plugin includes timeouts and small retries.
-
-**Note:** After installing via npm, the Python script is bundled with the plugin. The plugin will auto-detect it and your Python installation.
+You should see a JSON payload with sensor readings. If you get transient errors, re-run; CoAP can be flaky on first connection.
 
 ### Step 3: Install Homebridge Plugin
 
 ```bash
-# Install via npm (recommended)
+# Install via npm
 npm install -g @louis.crc/homebridge-philips-air-purifier
 
 # Or install via Homebridge UI:
-# Go to Plugins → Search for "@louis.crc/homebridge-philips-air-purifier" → Install
+# Plugins → Search "@louis.crc/homebridge-philips-air-purifier" → Install
 ```
-
-**Note:** The plugin includes the Python API script (`philips_air_api.py`) automatically. You only need to ensure Python 3 with `aioairctrl` is installed (Step 1).
 
 ### Step 4: Configure Homebridge
 
@@ -66,8 +61,8 @@ Add to your `config.json`:
   "accessories": [
     {
       "accessory": "PhilipsAirPurifier",
-      "name": "Living Room Air Purifier",
-      "host": "192.168.8.30"
+      "name": "Air Purifier",
+      "host": "192.168.1.100"
     }
   ]
 }
@@ -75,18 +70,16 @@ Add to your `config.json`:
 
 **Configuration Options:**
 
-- `name` - Name shown in HomeKit (required)
-- `host` - IP address of your air purifier (required)
-- `pollInterval` - How often to poll device (milliseconds, default: 10000)
-- `apiScriptPath` - Full path to `philips_air_api.py` (optional, auto-detected from plugin directory)
-- `pythonPath` - Path to Python 3 with `aioairctrl` (optional, auto-detected)
-
-**Note:** The plugin automatically finds the bundled Python script and detects Python installations with `aioairctrl`. You typically only need to specify `name` and `host`.
+| Option | Required | Default | Description |
+|--------|----------|---------|-------------|
+| `name` | Yes | - | Name shown in HomeKit |
+| `host` | Yes | - | IP address of your air purifier |
+| `pythonPath` | No | Auto-detected | Path to Python 3 with `aioairctrl` |
+| `apiScriptPath` | No | Auto-detected | Path to `philips_air_api.py` |
 
 ### Step 5: Restart Homebridge
 
 ```bash
-# Restart homebridge to load the plugin
 sudo systemctl restart homebridge
 # or use Homebridge UI to restart
 ```
@@ -95,12 +88,45 @@ sudo systemctl restart homebridge
 
 Once configured, you'll see your air purifier in the Apple Home app with:
 
-1. **Main Switch** - Power on/off
-2. **Target State** - Auto vs Manual
-3. **Rotation Speed (Manual)** - Discrete positions: 16% (Sleep), 50% (Medium), 83% (Turbo). Auto is managed by Target State to avoid slider jitter.
-4. **Air Quality Sensor** - PM2.5 density and derived quality
-5. **Display Light** - Toggle and adjust brightness (Off/Dim/Bright)
-6. **Auto Mode Switch** - Quick toggle for auto mode
+1. **Air Purifier** - Power on/off, Auto/Manual mode, rotation speed
+2. **Air Quality Sensor** - PM2.5 density and derived quality rating
+3. **Display Light** - Toggle and brightness (Off/Dim/Bright)
+4. **Child Lock** - Lock physical controls on the device
+
+## Architecture
+
+This plugin uses a Python daemon with **CoAP Observe** for efficient communication:
+
+- **Push updates**: Device pushes state changes (~every 30s or on change)
+- **Fast commands**: Power, mode, light commands complete in ~100-300ms
+- **No polling delays**: State reads are instant from cached data
+
+## CLI Tool
+
+The bundled Python script can also be used standalone:
+
+```bash
+# Get sensor readings
+python3 philips_air_api.py 192.168.1.100 sensors
+
+# Control power
+python3 philips_air_api.py 192.168.1.100 power on
+python3 philips_air_api.py 192.168.1.100 power off
+
+# Set mode
+python3 philips_air_api.py 192.168.1.100 mode auto
+python3 philips_air_api.py 192.168.1.100 mode sleep
+python3 philips_air_api.py 192.168.1.100 mode medium
+python3 philips_air_api.py 192.168.1.100 mode turbo
+
+# Control light (0=off, 115=dim, 123=bright)
+python3 philips_air_api.py 192.168.1.100 light 0
+python3 philips_air_api.py 192.168.1.100 light 123
+
+# Child lock
+python3 philips_air_api.py 192.168.1.100 childlock on
+python3 philips_air_api.py 192.168.1.100 childlock off
+```
 
 ## License
 

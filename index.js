@@ -1,10 +1,59 @@
-const { exec } = require('child_process');
-const util = require('util');
+/**
+ * Homebridge Philips Air Purifier Plugin
+ * 
+ * Controls Philips Air Purifiers via CoAP protocol using a persistent
+ * Python daemon with CoAP Observe for real-time push updates.
+ * 
+ * Architecture:
+ * - Python daemon maintains a CoAP Observe subscription
+ * - Device pushes state updates (~every 30s or on change)
+ * - Commands (power, mode, light, etc.) are sent directly and are fast
+ * - State reads use cached data from observe updates (instant)
+ */
+
+const { spawn } = require('child_process');
+const readline = require('readline');
 const path = require('path');
 const fs = require('fs');
-const execPromise = util.promisify(exec);
 
 let Service, Characteristic;
+
+// Constants for device values
+const MODE = {
+  AUTO: 0,
+  SLEEP: 17,
+  TURBO: 18,
+  MEDIUM: 19,
+};
+
+const MODE_NAME = {
+  [MODE.AUTO]: 'auto',
+  [MODE.SLEEP]: 'sleep',
+  [MODE.TURBO]: 'turbo',
+  [MODE.MEDIUM]: 'medium',
+};
+
+const LIGHT = {
+  OFF: 0,
+  DIM: 115,
+  BRIGHT: 123,
+};
+
+// Map rotation speed percentage to mode
+const SPEED_TO_MODE = [
+  { max: 0, mode: null },      // 0% = turn off
+  { max: 33, mode: 'sleep' },  // 1-33% = sleep
+  { max: 66, mode: 'medium' }, // 34-66% = medium
+  { max: 100, mode: 'turbo' }, // 67-100% = turbo
+];
+
+// Map mode to rotation speed percentage
+const MODE_TO_SPEED = {
+  auto: 100,
+  sleep: 16,
+  medium: 50,
+  turbo: 83,
+};
 
 module.exports = (homebridge) => {
   Service = homebridge.hap.Service;
@@ -16,19 +65,207 @@ module.exports = (homebridge) => {
   );
 };
 
+/**
+ * Daemon communication handler with CoAP Observe support.
+ * 
+ * The daemon uses CoAP Observe to receive push updates from the device.
+ * State reads are instant (cached), commands are sent directly.
+ */
+class DaemonHandler {
+  constructor(log, onUpdate) {
+    this.log = log;
+    this.onUpdate = onUpdate; // Callback for observe updates
+    this.daemon = null;
+    this.rl = null;
+    this.connected = false;
+    this.observing = false;
+    this.requestId = 0;
+    this.pendingRequests = new Map();
+    this.commandTimeout = 15000; // 15 seconds for commands (they're fast)
+  }
+
+  /**
+   * Start the Python daemon process.
+   */
+  async start(pythonPath, scriptPath, host) {
+    return new Promise((resolve, reject) => {
+      this.log.info(`Starting observe daemon: ${pythonPath} ${scriptPath} ${host} --daemon`);
+      
+      this.daemon = spawn(pythonPath, [scriptPath, host, '--daemon'], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, PYTHONUNBUFFERED: '1' }
+      });
+
+      this.daemon.on('error', (err) => {
+        this.log.error(`Daemon process error: ${err.message}`);
+        this.connected = false;
+        this.observing = false;
+      });
+
+      this.daemon.on('exit', (code, signal) => {
+        this.log.warn(`Daemon exited with code ${code}, signal ${signal}`);
+        this.connected = false;
+        this.observing = false;
+        this.daemon = null;
+        
+        // Reject all pending requests
+        for (const [id, { reject }] of this.pendingRequests) {
+          reject(new Error('Daemon exited'));
+        }
+        this.pendingRequests.clear();
+      });
+
+      // Handle stderr for logging
+      this.daemon.stderr.on('data', (data) => {
+        this.log.debug(`Daemon stderr: ${data.toString().trim()}`);
+      });
+
+      // Setup readline for stdout
+      this.rl = readline.createInterface({
+        input: this.daemon.stdout,
+        terminal: false
+      });
+
+      this.rl.on('line', (line) => {
+        this.handleMessage(line);
+      });
+
+      // Wait for ready signal
+      const timeout = setTimeout(() => {
+        reject(new Error('Daemon startup timeout'));
+      }, 20000); // 20s timeout for initial connection + first observe
+
+      const readyHandler = (line) => {
+        try {
+          const response = JSON.parse(line);
+          if (response.type === 'ready') {
+            clearTimeout(timeout);
+            this.rl.removeListener('line', readyHandler);
+            
+            this.connected = response.connected;
+            if (response.connected) {
+              this.log.info('Daemon ready, waiting for first observe update...');
+            } else {
+              this.log.warn(`Daemon ready but not connected: ${response.error}`);
+            }
+            resolve(response.connected);
+          }
+        } catch (e) {
+          // Not the ready message, ignore
+        }
+      };
+
+      this.rl.on('line', readyHandler);
+    });
+  }
+
+  /**
+   * Stop the daemon process.
+   */
+  stop() {
+    if (this.daemon) {
+      this.daemon.kill('SIGTERM');
+      this.daemon = null;
+    }
+    if (this.rl) {
+      this.rl.close();
+      this.rl = null;
+    }
+    this.connected = false;
+    this.observing = false;
+  }
+
+  /**
+   * Handle a message from the daemon.
+   */
+  handleMessage(line) {
+    try {
+      const message = JSON.parse(line);
+      
+      // Handle different message types
+      switch (message.type) {
+        case 'update':
+          // Push update from CoAP Observe
+          this.observing = true;
+          this.log.debug(`Observe update received: pm25=${message.data?.pm25}`);
+          if (this.onUpdate) {
+            this.onUpdate(message.data);
+          }
+          break;
+          
+        case 'log':
+          this.log.debug(`Daemon: [${message.event}] ${message.message}`);
+          break;
+          
+        case 'error':
+          this.log.error(`Daemon error: ${message.error}`);
+          break;
+          
+        case 'shutdown':
+          this.log.info('Daemon shutdown');
+          this.connected = false;
+          this.observing = false;
+          break;
+          
+        default:
+          // Handle request responses (have an 'id' field)
+          if (message.id !== undefined && this.pendingRequests.has(message.id)) {
+            const { resolve, reject, timeout } = this.pendingRequests.get(message.id);
+            clearTimeout(timeout);
+            this.pendingRequests.delete(message.id);
+            
+            if (message.success) {
+              resolve(message.data);
+            } else {
+              reject(new Error(message.error || 'Command failed'));
+            }
+          }
+          break;
+      }
+    } catch (e) {
+      this.log.debug(`Failed to parse daemon message: ${line}`);
+    }
+  }
+
+  /**
+   * Send a command to the daemon.
+   */
+  async execute(cmd, args = []) {
+    if (!this.daemon) {
+      throw new Error('Daemon not running');
+    }
+
+    return new Promise((resolve, reject) => {
+      const id = ++this.requestId;
+      
+      const timeout = setTimeout(() => {
+        this.pendingRequests.delete(id);
+        reject(new Error(`Command timeout: ${cmd}`));
+      }, this.commandTimeout);
+      
+      this.pendingRequests.set(id, { resolve, reject, timeout });
+      
+      const request = JSON.stringify({ id, cmd, args });
+      this.log.debug(`Sending command: ${request}`);
+      this.daemon.stdin.write(request + '\n');
+    });
+  }
+}
+
+/**
+ * Main accessory class for Philips Air Purifier.
+ */
 class PhilipsAirPurifierAccessory {
   constructor(log, config) {
     this.log = log;
     this.name = config.name || 'Air Purifier';
     this.host = config.host;
-    this.pollInterval = config.pollInterval || 10000;
 
     if (!this.host) {
       throw new Error('host is required in config');
     }
 
     const pluginDir = __dirname;
-
     this.apiScriptPath = config.apiScriptPath || path.join(pluginDir, 'philips_air_api.py');
     this.pythonPath = config.pythonPath || this.findPython(pluginDir);
 
@@ -39,23 +276,40 @@ class PhilipsAirPurifierAccessory {
     this.log.info(`Using Python: ${this.pythonPath}`);
     this.log.info(`Using API script: ${this.apiScriptPath}`);
 
+    // Device state
     this.state = {
       power: false,
       mode: 'auto',
-      lightLevel: 0,
+      lightLevel: LIGHT.OFF,
+      childLock: false,
       pm25: 0,
       iaql: 0,
+      filterLifePercent: 100,
+      cleanupPercent: 100,
+      temperature: null,
+      humidity: null,
     };
 
-    this.lastLightLevel = 0;
-    this.pollTimer = null;
-    this.pendingTimeouts = [];
-    this.isUpdating = false;
+    // Track device reachability
+    this.deviceReachable = false;
+    this.lastLightLevel = LIGHT.BRIGHT;
+    this.lastUpdateTime = 0;
+    this.lastPower = null;
+    this.lastMode = null;
+    
+    // Daemon handler with observe callback
+    this.daemon = new DaemonHandler(log, this.handleObserveUpdate.bind(this));
+    
+    // Command lock (prevent state updates during command execution)
+    this.commandLock = false;
 
     this.setupServices();
-    this.startPolling();
+    this.startDaemon();
   }
 
+  /**
+   * Find Python with aioairctrl installed.
+   */
   findPython(pluginDir) {
     const candidates = [
       path.join(pluginDir, '.venv', 'bin', 'python3'),
@@ -79,665 +333,522 @@ class PhilipsAirPurifierAccessory {
     }
 
     this.log.warn('Could not find Python with aioairctrl installed');
-    this.log.warn('Please install: pip3 install aioairctrl');
-    this.log.warn('Or specify pythonPath in config');
     return 'python3';
   }
 
+  /**
+   * Start the Python daemon.
+   */
+  async startDaemon() {
+    try {
+      const connected = await this.daemon.start(
+        this.pythonPath,
+        this.apiScriptPath,
+        this.host
+      );
+      
+      this.deviceReachable = connected;
+      this.updateReachabilityStatus();
+      
+      this.log.info('Daemon started, waiting for observe updates...');
+    } catch (error) {
+      this.log.error(`Failed to start daemon: ${error.message}`);
+      this.deviceReachable = false;
+      this.updateReachabilityStatus();
+    }
+  }
+
+  /**
+   * Handle a state update from CoAP Observe.
+   */
+  handleObserveUpdate(sensors) {
+    // Skip updates while a command is in progress
+    if (this.commandLock) {
+      this.log.debug('Skipping observe update - command in progress');
+      return;
+    }
+
+    // Update state from sensors
+    this.state.power = sensors.power;
+    this.state.mode = this.normalizeMode(sensors.mode);
+    this.state.lightLevel = sensors.light_level;
+    this.state.childLock = sensors.child_lock;
+    this.state.pm25 = sensors.pm25 || 0;
+    this.state.iaql = sensors.iaql || 0;
+    this.state.filterLifePercent = sensors.filter_life_percent || 100;
+    this.state.cleanupPercent = sensors.cleanup_percent || 100;
+    this.state.temperature = sensors.temperature;
+    this.state.humidity = sensors.humidity;
+
+    // Track last light level
+    if (this.state.lightLevel > 0) {
+      this.lastLightLevel = this.state.lightLevel;
+    }
+
+    // Mark as reachable and log first update or significant changes
+    const wasReachable = this.deviceReachable;
+    const powerChanged = this.lastPower !== this.state.power;
+    const modeChanged = this.lastMode !== this.state.mode;
+    
+    if (!wasReachable) {
+      this.deviceReachable = true;
+      this.log.info(`Device connected: power=${this.state.power ? 'ON' : 'OFF'}, mode=${this.state.mode}, pm25=${this.state.pm25}`);
+    } else if (powerChanged || modeChanged) {
+      this.log.info(`Status changed: power=${this.state.power ? 'ON' : 'OFF'}, mode=${this.state.mode}`);
+    }
+    
+    this.lastPower = this.state.power;
+    this.lastMode = this.state.mode;
+    this.lastUpdateTime = Date.now();
+
+    // Update all characteristics
+    this.updatePurifierCharacteristics();
+    this.updateLightCharacteristics();
+    this.updateAirQualityCharacteristics();
+    this.updateFilterCharacteristics();
+  }
+
+  /**
+   * Setup all HomeKit services.
+   */
   setupServices() {
+    // Accessory Information
     this.informationService = new Service.AccessoryInformation();
     this.informationService
       .setCharacteristic(Characteristic.Manufacturer, 'Philips')
       .setCharacteristic(Characteristic.Model, 'Air Purifier')
       .setCharacteristic(Characteristic.SerialNumber, this.host);
 
+    // Main Air Purifier Service
     this.purifierService = new Service.AirPurifier(this.name);
 
     this.purifierService
       .getCharacteristic(Characteristic.Active)
-      .on('get', this.getPowerState.bind(this))
-      .on('set', this.setPowerState.bind(this));
+      .on('get', this.handleGet.bind(this, 'Active'))
+      .on('set', this.handleSetPower.bind(this));
 
     this.purifierService
       .getCharacteristic(Characteristic.CurrentAirPurifierState)
-      .on('get', this.getCurrentState.bind(this));
+      .on('get', this.handleGet.bind(this, 'CurrentAirPurifierState'));
 
     this.purifierService
       .getCharacteristic(Characteristic.TargetAirPurifierState)
-      .on('get', this.getTargetState.bind(this))
-      .on('set', this.setTargetState.bind(this));
+      .on('get', this.handleGet.bind(this, 'TargetAirPurifierState'))
+      .on('set', this.handleSetTargetState.bind(this));
 
     this.purifierService
       .addCharacteristic(Characteristic.RotationSpeed)
-      .on('get', this.getRotationSpeed.bind(this))
-      .on('set', this.setRotationSpeed.bind(this));
+      .on('get', this.handleGet.bind(this, 'RotationSpeed'))
+      .on('set', this.handleSetRotationSpeed.bind(this));
 
-    this.autoModeSwitch = new Service.Switch('Auto Mode');
-    this.autoModeSwitch
-      .getCharacteristic(Characteristic.On)
-      .on('get', this.getAutoMode.bind(this))
-      .on('set', this.setAutoMode.bind(this));
+    // Child Lock (LockPhysicalControls)
+    this.purifierService
+      .addCharacteristic(Characteristic.LockPhysicalControls)
+      .on('get', this.handleGet.bind(this, 'LockPhysicalControls'))
+      .on('set', this.handleSetChildLock.bind(this));
 
+    // Air Quality Sensor
     this.airQualitySensor = new Service.AirQualitySensor('Air Quality');
-
     this.airQualitySensor
       .getCharacteristic(Characteristic.AirQuality)
-      .on('get', this.getAirQuality.bind(this));
-
+      .on('get', this.handleGet.bind(this, 'AirQuality'));
     this.airQualitySensor
       .addCharacteristic(Characteristic.PM2_5Density)
-      .on('get', this.getPM25.bind(this));
+      .on('get', this.handleGet.bind(this, 'PM2_5Density'));
 
+    // HEPA Filter Maintenance
+    this.hepaFilterService = new Service.FilterMaintenance('HEPA Filter', 'hepa-filter');
+    this.hepaFilterService
+      .getCharacteristic(Characteristic.FilterLifeLevel)
+      .on('get', this.handleGet.bind(this, 'HEPAFilterLifeLevel'));
+    this.hepaFilterService
+      .getCharacteristic(Characteristic.FilterChangeIndication)
+      .on('get', this.handleGet.bind(this, 'HEPAFilterChangeIndication'));
+
+    // Pre-Filter Maintenance (cleanup indicator)
+    this.preFilterService = new Service.FilterMaintenance('Pre-Filter', 'pre-filter');
+    this.preFilterService
+      .getCharacteristic(Characteristic.FilterLifeLevel)
+      .on('get', this.handleGet.bind(this, 'PreFilterLifeLevel'));
+    this.preFilterService
+      .getCharacteristic(Characteristic.FilterChangeIndication)
+      .on('get', this.handleGet.bind(this, 'PreFilterChangeIndication'));
+
+    // Display Light
     this.lightService = new Service.Lightbulb('Display Light');
-
     this.lightService
       .getCharacteristic(Characteristic.On)
-      .on('get', this.getLightState.bind(this))
-      .on('set', this.setLightState.bind(this));
-
+      .on('get', this.handleGet.bind(this, 'LightOn'))
+      .on('set', this.handleSetLightOn.bind(this));
     this.lightService
       .addCharacteristic(Characteristic.Brightness)
-      .on('get', this.getLightBrightness.bind(this))
-      .on('set', this.setLightBrightness.bind(this));
+      .on('get', this.handleGet.bind(this, 'LightBrightness'))
+      .on('set', this.handleSetLightBrightness.bind(this));
+
+    // Link secondary services to primary
+    this.purifierService.addLinkedService(this.airQualitySensor);
+    this.purifierService.addLinkedService(this.hepaFilterService);
+    this.purifierService.addLinkedService(this.preFilterService);
+    this.purifierService.addLinkedService(this.lightService);
   }
 
-  async executeCommand(command, ...args) {
-    const cmdArgs = args.length > 0 ? ' ' + args.join(' ') : '';
-    const cmd = `${this.pythonPath} ${this.apiScriptPath} ${this.host} ${command}${cmdArgs}`;
-
-    this.log.debug(`Executing: ${cmd}`);
-
-    try {
-      const { stdout, stderr } = await execPromise(cmd);
-
-      if (stderr && stderr.trim()) {
-        this.log.debug(`stderr: ${stderr}`);
-      }
-
-      try {
-        return JSON.parse(stdout);
-      } catch {
-        return stdout.trim();
-      }
-    } catch (error) {
-      this.log.error(`Command failed: ${error.message}`);
-      throw error;
-    }
+  /**
+   * Generic getter for characteristics.
+   */
+  handleGet(characteristic, callback) {
+    const value = this.getCharacteristicValue(characteristic);
+    this.log.debug(`[GET] ${characteristic}: ${value}`);
+    callback(null, value);
   }
 
-  async updateStatus() {
-    if (this.isUpdating) {
-      this.log.debug('Update already in progress, skipping...');
-      return;
-    }
-
-    this.isUpdating = true;
-    try {
-      const sensors = await this.executeCommand('sensors');
-
-      this.state.power = sensors.power;
-      this.state.mode = sensors.mode;
-      this.state.lightLevel = sensors.light_level || 0;
-      this.state.pm25 = sensors.pm25 || 0;
-      this.state.iaql = sensors.iaql || 0;
-
-      this.log.debug('Status updated:', this.state);
-
-      this.purifierService
-        .getCharacteristic(Characteristic.Active)
-        .updateValue(this.state.power ? 1 : 0);
-
-      const currentState = this.state.power
+  /**
+   * Get the current value for a characteristic.
+   */
+  getCharacteristicValue(characteristic) {
+    switch (characteristic) {
+      case 'Active':
+        return this.state.power ? 1 : 0;
+      
+      case 'CurrentAirPurifierState':
+        return this.state.power
         ? Characteristic.CurrentAirPurifierState.PURIFYING_AIR
         : Characteristic.CurrentAirPurifierState.INACTIVE;
-      this.purifierService
-        .getCharacteristic(Characteristic.CurrentAirPurifierState)
-        .updateValue(currentState);
-
-      const speedMap = {
-        0: 100,
-        17: 16,
-        19: 50,
-        18: 83,
-        auto: 100,
-        sleep: 16,
-        medium: 50,
-        turbo: 83,
-      };
-      const rotationSpeed = speedMap[this.state.mode] || 100;
-      this.purifierService
-        .getCharacteristic(Characteristic.RotationSpeed)
-        .updateValue(rotationSpeed);
-
-      const isAuto = this.state.mode === 0 || this.state.mode === 'auto' || this.state.mode === 'A';
-      const targetState = isAuto
+      
+      case 'TargetAirPurifierState':
+        return this.state.mode === 'auto'
         ? Characteristic.TargetAirPurifierState.AUTO
         : Characteristic.TargetAirPurifierState.MANUAL;
-      this.purifierService
-        .getCharacteristic(Characteristic.TargetAirPurifierState)
-        .updateValue(targetState);
+      
+      case 'RotationSpeed':
+        return MODE_TO_SPEED[this.state.mode] || 100;
+      
+      case 'LockPhysicalControls':
+        return this.state.childLock
+          ? Characteristic.LockPhysicalControls.CONTROL_LOCK_ENABLED
+          : Characteristic.LockPhysicalControls.CONTROL_LOCK_DISABLED;
+      
+      case 'AirQuality':
+        return this.pm25ToAirQuality(this.state.pm25);
+      
+      case 'PM2_5Density':
+        return this.state.pm25 || 0;
+      
+      case 'HEPAFilterLifeLevel':
+        return Math.round(this.state.filterLifePercent);
+      
+      case 'HEPAFilterChangeIndication':
+        return this.state.filterLifePercent < 10
+          ? Characteristic.FilterChangeIndication.CHANGE_FILTER
+          : Characteristic.FilterChangeIndication.FILTER_OK;
+      
+      case 'PreFilterLifeLevel':
+        return Math.round(this.state.cleanupPercent);
+      
+      case 'PreFilterChangeIndication':
+        return this.state.cleanupPercent < 10
+          ? Characteristic.FilterChangeIndication.CHANGE_FILTER
+          : Characteristic.FilterChangeIndication.FILTER_OK;
+      
+      case 'LightOn':
+        return this.state.lightLevel > 0;
+      
+      case 'LightBrightness':
+        if (this.state.lightLevel === LIGHT.OFF) return 0;
+        if (this.state.lightLevel === LIGHT.DIM) return 50;
+        return 100;
+      
+      default:
+        return null;
+    }
+  }
 
-      this.autoModeSwitch.getCharacteristic(Characteristic.On).updateValue(isAuto);
+  /**
+   * Convert PM2.5 value to HomeKit AirQuality enum.
+   */
+  pm25ToAirQuality(pm25) {
+    if (!pm25 || pm25 === 0) return Characteristic.AirQuality.UNKNOWN;
+    if (pm25 <= 12) return Characteristic.AirQuality.EXCELLENT;
+    if (pm25 <= 35) return Characteristic.AirQuality.GOOD;
+    if (pm25 <= 55) return Characteristic.AirQuality.FAIR;
+    if (pm25 <= 100) return Characteristic.AirQuality.INFERIOR;
+    return Characteristic.AirQuality.POOR;
+  }
 
-      if (this.state.pm25 > 0) {
-        this.airQualitySensor
-          .getCharacteristic(Characteristic.PM2_5Density)
-          .updateValue(this.state.pm25);
+  /**
+   * Normalize mode value from device to string.
+   */
+  normalizeMode(mode) {
+    if (typeof mode === 'string') {
+      return mode.toLowerCase();
+    }
+    return MODE_NAME[mode] || 'auto';
+  }
 
-        let airQuality = Characteristic.AirQuality.UNKNOWN;
-        if (this.state.pm25 <= 12) {
-          airQuality = Characteristic.AirQuality.EXCELLENT;
-        } else if (this.state.pm25 <= 35) {
-          airQuality = Characteristic.AirQuality.GOOD;
-        } else if (this.state.pm25 <= 55) {
-          airQuality = Characteristic.AirQuality.FAIR;
-        } else if (this.state.pm25 <= 100) {
-          airQuality = Characteristic.AirQuality.INFERIOR;
-        } else {
-          airQuality = Characteristic.AirQuality.POOR;
-        }
-        this.airQualitySensor.getCharacteristic(Characteristic.AirQuality).updateValue(airQuality);
-      }
-
-      const lightOn = this.state.lightLevel > 0;
-      this.lightService.getCharacteristic(Characteristic.On).updateValue(lightOn);
-
-      let brightness = 0;
-      if (this.state.lightLevel === 0) {
-        brightness = 0;
-      } else if (this.state.lightLevel === 115) {
-        brightness = 50;
-      } else if (this.state.lightLevel === 123) {
-        brightness = 100;
-      }
-      this.lightService.getCharacteristic(Characteristic.Brightness).updateValue(brightness);
+  /**
+   * Execute a command with optimistic update.
+   * Sets the state immediately, sends command, then waits for observe confirmation.
+   */
+  async executeCommand(cmd, args, optimisticState = {}) {
+    this.commandLock = true;
+    
+    // Apply optimistic state
+    Object.assign(this.state, optimisticState);
+    
+    try {
+      await this.daemon.execute(cmd, args);
+      this.log.debug(`Command ${cmd} succeeded`);
     } catch (error) {
-      this.log.error('Failed to update status:', error.message);
+      this.log.error(`Command ${cmd} failed: ${error.message}`);
+      throw error;
     } finally {
-      this.isUpdating = false;
+      // Unlock after a short delay to let device process
+      setTimeout(() => {
+        this.commandLock = false;
+      }, 500);
     }
   }
 
-  startPolling() {
-    this.stopPolling();
-    this.updateStatus();
-    this.pollTimer = setInterval(() => {
-      this.updateStatus();
-    }, this.pollInterval);
-  }
+  /**
+   * Set power state.
+   */
+  async handleSetPower(value, callback) {
+    const powerOn = value === 1;
+    this.log.info(`[SET] Power: ${powerOn ? 'ON' : 'OFF'}`);
 
-  stopPolling() {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
-  }
-
-  clearAllTimeouts() {
-    this.pendingTimeouts.forEach(timeout => clearTimeout(timeout));
-    this.pendingTimeouts = [];
-  }
-
-  safeSetTimeout(callback, delay) {
-    const timeout = setTimeout(() => {
-      this.pendingTimeouts = this.pendingTimeouts.filter(t => t !== timeout);
-      callback();
-    }, delay);
-    this.pendingTimeouts.push(timeout);
-    return timeout;
-  }
-
-  async getPowerState(callback) {
     try {
-      callback(null, this.state.power ? 1 : 0);
-    } catch (error) {
-      callback(error);
-    }
-  }
-
-  async setPowerState(value, callback) {
-    try {
-      const powerState = value === 1 ? 'on' : 'off';
-      this.log.info(`[setPowerState] Setting power to ${powerState}`);
-      this.log.debug(
-        `[setPowerState] Current state - power: ${this.state.power}, mode: ${this.state.mode}, lightLevel: ${this.state.lightLevel}`
-      );
-
-      if (!value) {
-        if (this.state.lightLevel > 0) {
-          this.lastLightLevel = this.state.lightLevel;
-          this.log.info(`[setPowerState] Stored last light level: ${this.lastLightLevel}`);
-        }
-
-        const wasAutoMode =
-          this.state.mode === 'auto' || this.state.mode === 0 || this.state.mode === 'A';
-        if (wasAutoMode) {
-          this.log.info(
-            '[setPowerState] Device is in auto mode, switching to manual (medium) before turning off'
-          );
-          try {
-            await this.executeCommand('mode', 'medium');
-            this.state.mode = 'medium';
-            this.log.info('[setPowerState] Successfully set mode to medium');
-          } catch (error) {
-            this.log.error(`[setPowerState] Failed to set mode to medium: ${error.message}`);
-          }
-        }
-
-        await this.executeCommand('power', powerState);
-        this.state.power = false;
-
-        this.autoModeSwitch.getCharacteristic(Characteristic.On).updateValue(false);
-        this.log.info('[setPowerState] Auto Mode switch turned off');
-
-        await this.executeCommand('light', '0');
-        this.state.lightLevel = 0;
-        this.lightService.getCharacteristic(Characteristic.On).updateValue(false);
-        this.lightService.getCharacteristic(Characteristic.Brightness).updateValue(0);
-        this.log.info('[setPowerState] Light turned off');
-      } else {
-        await this.executeCommand('power', powerState);
-        this.state.power = true;
-
-        if (this.lastLightLevel > 0) {
-          this.log.info(`[setPowerState] Restoring last light level: ${this.lastLightLevel}`);
-          try {
-            await this.executeCommand('light', this.lastLightLevel.toString());
-            this.state.lightLevel = this.lastLightLevel;
-
-            const lightOn = this.lastLightLevel > 0;
-            let brightness = 0;
-            if (this.lastLightLevel === 115) brightness = 50;
-            else if (this.lastLightLevel === 123) brightness = 100;
-
-            this.lightService.getCharacteristic(Characteristic.On).updateValue(lightOn);
-            this.lightService.getCharacteristic(Characteristic.Brightness).updateValue(brightness);
-            this.log.info(
-              `[setPowerState] Light restored to level ${this.lastLightLevel} (brightness: ${brightness}%)`
-            );
-          } catch (error) {
-            this.log.error(`[setPowerState] Failed to restore light level: ${error.message}`);
-          }
-        }
-      }
-
-      this.log.info(`[setPowerState] Power set to ${powerState} - complete`);
-      this.safeSetTimeout(() => this.updateStatus(), 1000);
+      await this.executeCommand('power', [powerOn ? 'on' : 'off'], { power: powerOn });
+      this.updatePurifierCharacteristics();
       callback(null);
     } catch (error) {
-      this.log.error(`[setPowerState] Failed to set power: ${error.message}`);
       callback(error);
     }
   }
 
-  async getCurrentState(callback) {
+  /**
+   * Set target state (auto/manual).
+   */
+  async handleSetTargetState(value, callback) {
+    const isAuto = value === Characteristic.TargetAirPurifierState.AUTO;
+    const mode = isAuto ? 'auto' : 'medium';
+    this.log.info(`[SET] TargetState: ${isAuto ? 'AUTO' : 'MANUAL'}`);
+
     try {
+      // Turn on if off
       if (!this.state.power) {
-        callback(null, Characteristic.CurrentAirPurifierState.INACTIVE);
-      } else {
-        callback(null, Characteristic.CurrentAirPurifierState.PURIFYING_AIR);
+        await this.executeCommand('power', ['on'], { power: true });
       }
-    } catch (error) {
-      callback(error);
-    }
-  }
 
-  async getTargetState(callback) {
-    try {
-      const isAuto = this.state.mode === 'A' || this.state.mode === 'auto';
-      callback(
-        null,
-        isAuto
-          ? Characteristic.TargetAirPurifierState.AUTO
-          : Characteristic.TargetAirPurifierState.MANUAL
-      );
-    } catch (error) {
-      callback(error);
-    }
-  }
-
-  async setTargetState(value, callback) {
-    try {
-      const mode = value === Characteristic.TargetAirPurifierState.AUTO ? 'auto' : 'medium';
-      await this.executeCommand('mode', mode);
-      this.state.mode = mode;
-      this.log.info(`Mode set to ${mode}`);
+      await this.executeCommand('mode', [mode], { mode });
+      this.updatePurifierCharacteristics();
       callback(null);
     } catch (error) {
-      this.log.error('Failed to set mode:', error);
       callback(error);
     }
   }
 
-  async getRotationSpeed(callback) {
-    try {
-      const speedMap = {
-        0: 100,
-        17: 16,
-        19: 50,
-        18: 83,
-        auto: 100,
-        sleep: 16,
-        medium: 50,
-        turbo: 83,
-      };
+  /**
+   * Set rotation speed (maps to mode).
+   */
+  async handleSetRotationSpeed(value, callback) {
+    this.log.info(`[SET] RotationSpeed: ${value}%`);
 
-      const speed = speedMap[this.state.mode] || 100;
-      callback(null, speed);
-    } catch (error) {
-      callback(error);
-    }
-  }
-
-  async setRotationSpeed(value, callback) {
     try {
+      // Speed 0 = turn off
       if (value === 0) {
-        this.log.info('[setRotationSpeed] Fan set to 0%, turning off device');
-        this.log.debug(
-          `[setRotationSpeed] Current state - power: ${this.state.power}, mode: ${this.state.mode}, lightLevel: ${this.state.lightLevel}`
-        );
-
-        if (this.state.lightLevel > 0) {
-          this.lastLightLevel = this.state.lightLevel;
-          this.log.info(`[setRotationSpeed] Stored last light level: ${this.lastLightLevel}`);
-        }
-
-        const wasAutoMode =
-          this.state.mode === 'auto' || this.state.mode === 0 || this.state.mode === 'A';
-        if (wasAutoMode) {
-          this.log.info(
-            '[setRotationSpeed] Device is in auto mode, switching to manual (medium) before turning off'
-          );
-          try {
-            await this.executeCommand('mode', 'medium');
-            this.state.mode = 'medium';
-            this.log.info('[setRotationSpeed] Successfully set mode to medium');
-          } catch (error) {
-            this.log.error(`[setRotationSpeed] Failed to set mode to medium: ${error.message}`);
-          }
-        }
-
-        await this.executeCommand('power', 'off');
-        this.state.power = false;
-        this.log.info('[setRotationSpeed] Device power turned off');
-
-        this.autoModeSwitch.getCharacteristic(Characteristic.On).updateValue(false);
-        this.log.info('[setRotationSpeed] Auto Mode switch turned off');
-
-        await this.executeCommand('light', '0');
-        this.state.lightLevel = 0;
-        this.lightService.getCharacteristic(Characteristic.On).updateValue(false);
-        this.lightService.getCharacteristic(Characteristic.Brightness).updateValue(0);
-        this.log.info('[setRotationSpeed] Light turned off');
-
-        this.purifierService.getCharacteristic(Characteristic.Active).updateValue(0);
-
-        this.log.info('[setRotationSpeed] Device turned off (fan set to 0%) - complete');
-        this.safeSetTimeout(() => this.updateStatus(), 1000);
-        callback(null);
-        return;
-      }
-
-      if (!this.state.power) {
-        this.log.info('[setRotationSpeed] Device is off, turning on before setting mode');
-        await this.executeCommand('power', 'on');
-        this.state.power = true;
-        this.purifierService.getCharacteristic(Characteristic.Active).updateValue(1);
-
-        if (this.lastLightLevel > 0) {
-          this.log.info(`[setRotationSpeed] Restoring last light level: ${this.lastLightLevel}`);
-          try {
-            await this.executeCommand('light', this.lastLightLevel.toString());
-            this.state.lightLevel = this.lastLightLevel;
-
-            const lightOn = this.lastLightLevel > 0;
-            let brightness = 0;
-            if (this.lastLightLevel === 115) brightness = 50;
-            else if (this.lastLightLevel === 123) brightness = 100;
-
-            this.lightService.getCharacteristic(Characteristic.On).updateValue(lightOn);
-            this.lightService.getCharacteristic(Characteristic.Brightness).updateValue(brightness);
-            this.log.info(
-              `[setRotationSpeed] Light restored to level ${this.lastLightLevel} (brightness: ${brightness}%)`
-            );
-          } catch (error) {
-            this.log.error(`[setRotationSpeed] Failed to restore light level: ${error.message}`);
-          }
-        }
-      }
-
-      let mode = 'sleep';
-      if (value <= 33) {
-        mode = 'sleep';
-      } else if (value <= 66) {
-        mode = 'medium';
+        await this.executeCommand('power', ['off'], { power: false });
       } else {
-        mode = 'turbo';
-      }
-
-      await this.executeCommand('mode', mode);
-      this.state.mode = mode;
-
-      this.autoModeSwitch.getCharacteristic(Characteristic.On).updateValue(false);
-
-      this.log.info(`Mode set to ${mode} (speed: ${value}%)`);
-      this.safeSetTimeout(() => this.updateStatus(), 1000);
-      callback(null);
-    } catch (error) {
-      this.log.error('Failed to set rotation speed:', error);
-      callback(error);
-    }
-  }
-
-  async getAirQuality(callback) {
-    try {
-      const pm25 = this.state.pm25 || 0;
-
-      let quality = Characteristic.AirQuality.UNKNOWN;
-      if (pm25 === 0) {
-        quality = Characteristic.AirQuality.UNKNOWN;
-      } else if (pm25 <= 12) {
-        quality = Characteristic.AirQuality.EXCELLENT;
-      } else if (pm25 <= 35) {
-        quality = Characteristic.AirQuality.GOOD;
-      } else if (pm25 <= 55) {
-        quality = Characteristic.AirQuality.FAIR;
-      } else if (pm25 <= 100) {
-        quality = Characteristic.AirQuality.INFERIOR;
-      } else {
-        quality = Characteristic.AirQuality.POOR;
-      }
-
-      this.log.debug(`Air Quality: PM2.5=${pm25} → ${quality}`);
-      callback(null, quality);
-    } catch (error) {
-      callback(error);
-    }
-  }
-
-  async getPM25(callback) {
-    try {
-      const value = this.state.pm25 || 0;
-      this.log.debug(`PM2.5 Density: ${value}`);
-      callback(null, value);
-    } catch (error) {
-      callback(error);
-    }
-  }
-
-  async getAutoMode(callback) {
-    try {
-      const isAuto = this.state.mode === 0 || this.state.mode === 'auto' || this.state.mode === 'A';
-      callback(null, isAuto);
-    } catch (error) {
-      callback(error);
-    }
-  }
-
-  async setAutoMode(value, callback) {
-    try {
-      this.log.info(`[setAutoMode] Setting auto mode to ${value}`);
-      this.log.debug(
-        `[setAutoMode] Current state - power: ${this.state.power}, mode: ${this.state.mode}`
-      );
-
-      if (value) {
+        // Turn on if off
         if (!this.state.power) {
-          this.log.info('[setAutoMode] Device is off, turning on first');
-          await this.executeCommand('power', 'on');
-          this.state.power = true;
-          this.purifierService.getCharacteristic(Characteristic.Active).updateValue(1);
-
-          if (this.lastLightLevel > 0) {
-            this.log.info(`[setAutoMode] Restoring last light level: ${this.lastLightLevel}`);
-            try {
-              await this.executeCommand('light', this.lastLightLevel.toString());
-              this.state.lightLevel = this.lastLightLevel;
-
-              const lightOn = this.lastLightLevel > 0;
-              let brightness = 0;
-              if (this.lastLightLevel === 115) brightness = 50;
-              else if (this.lastLightLevel === 123) brightness = 100;
-
-              this.lightService.getCharacteristic(Characteristic.On).updateValue(lightOn);
-              this.lightService
-                .getCharacteristic(Characteristic.Brightness)
-                .updateValue(brightness);
-              this.log.info(
-                `[setAutoMode] Light restored to level ${this.lastLightLevel} (brightness: ${brightness}%)`
-              );
-            } catch (error) {
-              this.log.error(`[setAutoMode] Failed to restore light level: ${error.message}`);
-            }
-          }
-
-          this.log.info('[setAutoMode] Device turned on');
+          await this.executeCommand('power', ['on'], { power: true });
         }
 
-        await this.executeCommand('mode', 'auto');
-        this.state.mode = 'auto';
-        this.log.info('[setAutoMode] Auto Mode enabled');
+        // Find mode for speed
+        let mode = 'medium';
+        for (const { max, mode: m } of SPEED_TO_MODE) {
+          if (value <= max && m !== null) {
+            mode = m;
+            break;
+          }
+        }
 
-        this.purifierService.getCharacteristic(Characteristic.RotationSpeed).updateValue(100);
+        await this.executeCommand('mode', [mode], { mode });
+      }
+
+      this.updatePurifierCharacteristics();
+      callback(null);
+    } catch (error) {
+      callback(error);
+    }
+  }
+
+  /**
+   * Set child lock.
+   */
+  async handleSetChildLock(value, callback) {
+    const enabled = value === Characteristic.LockPhysicalControls.CONTROL_LOCK_ENABLED;
+    this.log.info(`[SET] ChildLock: ${enabled ? 'ENABLED' : 'DISABLED'}`);
+
+    try {
+      await this.executeCommand('childlock', [enabled ? 'on' : 'off'], { childLock: enabled });
+      callback(null);
+    } catch (error) {
+      callback(error);
+    }
+  }
+
+  /**
+   * Set light on/off.
+   */
+  async handleSetLightOn(value, callback) {
+    this.log.info(`[SET] Light: ${value ? 'ON' : 'OFF'}`);
+
+    try {
+      let level;
+      if (value) {
+        // Turn on - use last known level or bright
+        level = this.lastLightLevel > 0 ? this.lastLightLevel : LIGHT.BRIGHT;
       } else {
-        await this.executeCommand('mode', 'medium');
-        this.state.mode = 'medium';
-        this.log.info('[setAutoMode] Auto Mode disabled, switched to manual (medium)');
-
-        this.purifierService.getCharacteristic(Characteristic.RotationSpeed).updateValue(50);
+        // Turn off - save current level first
+        if (this.state.lightLevel > 0) {
+          this.lastLightLevel = this.state.lightLevel;
+        }
+        level = LIGHT.OFF;
       }
 
-      this.log.info(`[setAutoMode] Auto mode set to ${value} - complete`);
-      this.safeSetTimeout(() => this.updateStatus(), 1000);
+      await this.executeCommand('light', [level.toString()], { lightLevel: level });
+      this.updateLightCharacteristics();
       callback(null);
     } catch (error) {
-      this.log.error(`[setAutoMode] Failed to set auto mode: ${error.message}`);
       callback(error);
     }
   }
 
-  async getLightState(callback) {
+  /**
+   * Set light brightness.
+   */
+  async handleSetLightBrightness(value, callback) {
+    this.log.info(`[SET] LightBrightness: ${value}%`);
+
     try {
-      callback(null, this.state.lightLevel > 0);
-    } catch (error) {
-      callback(error);
-    }
-  }
-
-  async setLightState(value, callback) {
-    try {
-      const deviceLevel = value
-        ? this.state.lightLevel > 0
-          ? this.state.lightLevel
-          : this.lastLightLevel > 0
-            ? this.lastLightLevel
-            : 123
-        : 0;
-
-      if (value && deviceLevel > 0) {
-        this.lastLightLevel = deviceLevel;
-        this.log.debug(`[setLightState] Updated last light level to: ${this.lastLightLevel}`);
-      }
-
-      await this.executeCommand('light', deviceLevel.toString());
-      this.state.lightLevel = deviceLevel;
-      this.log.info(
-        `[setLightState] Light set to ${value ? 'on' : 'off'} (device: ${deviceLevel})`
-      );
-      this.safeSetTimeout(() => this.updateStatus(), 1000);
-      callback(null);
-    } catch (error) {
-      this.log.error(`[setLightState] Failed to set light state: ${error.message}`);
-      callback(error);
-    }
-  }
-
-  async getLightBrightness(callback) {
-    try {
-      let brightness = 0;
-      if (this.state.lightLevel === 115) brightness = 50;
-      else if (this.state.lightLevel === 123) brightness = 100;
-      callback(null, brightness);
-    } catch (error) {
-      callback(error);
-    }
-  }
-
-  async setLightBrightness(value, callback) {
-    try {
-      let deviceLevel = 0;
-      let adjustedBrightness = 0;
-
+      let level;
       if (value === 0) {
-        deviceLevel = 0;
-        adjustedBrightness = 0;
-      } else if (value >= 1 && value <= 50) {
-        deviceLevel = 115;
-        adjustedBrightness = 50;
-      } else if (value >= 51 && value <= 100) {
-        deviceLevel = 123;
-        adjustedBrightness = 100;
+        level = LIGHT.OFF;
+      } else if (value <= 50) {
+        level = LIGHT.DIM;
+      } else {
+        level = LIGHT.BRIGHT;
       }
 
-      if (deviceLevel > 0) {
-        this.lastLightLevel = deviceLevel;
-        this.log.debug(`[setLightBrightness] Updated last light level to: ${this.lastLightLevel}`);
+      if (level > 0) {
+        this.lastLightLevel = level;
       }
 
-      await this.executeCommand('light', deviceLevel.toString());
-      this.state.lightLevel = deviceLevel;
-
-      this.lightService
-        .getCharacteristic(Characteristic.Brightness)
-        .updateValue(adjustedBrightness);
-
-      this.log.info(
-        `[setLightBrightness] Light brightness set to ${value}% → snapped to ${adjustedBrightness}% (device: ${deviceLevel} - ${deviceLevel === 115 ? 'dim' : deviceLevel === 123 ? 'full' : 'off'})`
-      );
-      this.safeSetTimeout(() => this.updateStatus(), 1000);
+      await this.executeCommand('light', [level.toString()], { lightLevel: level });
+      this.updateLightCharacteristics();
       callback(null);
     } catch (error) {
-      this.log.error(`[setLightBrightness] Failed to set light brightness: ${error.message}`);
       callback(error);
     }
   }
 
+  /**
+   * Update purifier characteristics in HomeKit.
+   */
+  updatePurifierCharacteristics() {
+    this.purifierService
+      .getCharacteristic(Characteristic.Active)
+      .updateValue(this.getCharacteristicValue('Active'));
+
+    this.purifierService
+      .getCharacteristic(Characteristic.CurrentAirPurifierState)
+      .updateValue(this.getCharacteristicValue('CurrentAirPurifierState'));
+
+    this.purifierService
+      .getCharacteristic(Characteristic.TargetAirPurifierState)
+      .updateValue(this.getCharacteristicValue('TargetAirPurifierState'));
+
+    this.purifierService
+      .getCharacteristic(Characteristic.RotationSpeed)
+      .updateValue(this.getCharacteristicValue('RotationSpeed'));
+
+    this.purifierService
+      .getCharacteristic(Characteristic.LockPhysicalControls)
+      .updateValue(this.getCharacteristicValue('LockPhysicalControls'));
+  }
+
+  /**
+   * Update light characteristics in HomeKit.
+   */
+  updateLightCharacteristics() {
+    this.lightService
+      .getCharacteristic(Characteristic.On)
+      .updateValue(this.getCharacteristicValue('LightOn'));
+
+    this.lightService
+      .getCharacteristic(Characteristic.Brightness)
+      .updateValue(this.getCharacteristicValue('LightBrightness'));
+  }
+
+  /**
+   * Update air quality characteristics in HomeKit.
+   */
+  updateAirQualityCharacteristics() {
+    this.airQualitySensor
+      .getCharacteristic(Characteristic.AirQuality)
+      .updateValue(this.getCharacteristicValue('AirQuality'));
+
+    this.airQualitySensor
+      .getCharacteristic(Characteristic.PM2_5Density)
+      .updateValue(this.getCharacteristicValue('PM2_5Density'));
+  }
+
+  /**
+   * Update filter characteristics in HomeKit.
+   */
+  updateFilterCharacteristics() {
+    this.hepaFilterService
+      .getCharacteristic(Characteristic.FilterLifeLevel)
+      .updateValue(this.getCharacteristicValue('HEPAFilterLifeLevel'));
+
+    this.hepaFilterService
+      .getCharacteristic(Characteristic.FilterChangeIndication)
+      .updateValue(this.getCharacteristicValue('HEPAFilterChangeIndication'));
+
+    this.preFilterService
+      .getCharacteristic(Characteristic.FilterLifeLevel)
+      .updateValue(this.getCharacteristicValue('PreFilterLifeLevel'));
+
+    this.preFilterService
+      .getCharacteristic(Characteristic.FilterChangeIndication)
+      .updateValue(this.getCharacteristicValue('PreFilterChangeIndication'));
+  }
+
+  /**
+   * Update device reachability status.
+   */
+  updateReachabilityStatus() {
+    if (!this.deviceReachable) {
+      this.log.warn('Device unreachable');
+    }
+  }
+
+  /**
+   * Return all services for this accessory.
+   */
   getServices() {
     return [
       this.informationService,
       this.purifierService,
-      this.autoModeSwitch,
       this.airQualitySensor,
+      this.hepaFilterService,
+      this.preFilterService,
       this.lightService,
     ];
   }
 
-  configure() {
-    this.stopPolling();
-    this.clearAllTimeouts();
-    this.startPolling();
-  }
-
+  /**
+   * Identify the accessory.
+   */
   identify(callback) {
     this.log.info(`Identify requested for ${this.name}`);
     callback(null);
