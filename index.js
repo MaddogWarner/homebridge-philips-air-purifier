@@ -86,7 +86,12 @@ class DaemonHandler {
 
       this.daemon = spawn(pythonPath, [scriptPath, host, '--daemon'], {
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, PYTHONUNBUFFERED: '1' },
+        env: {
+          PATH: process.env.PATH,
+          HOME: process.env.HOME,
+          LANG: process.env.LANG || 'en_US.UTF-8',
+          PYTHONUNBUFFERED: '1',
+        },
       });
 
       this.daemon.on('error', (err) => {
@@ -226,13 +231,20 @@ class PhilipsAirPurifierAccessory {
     if (!this.host) {
       throw new Error('host is required in config');
     }
+    this.validateHost(this.host);
 
     const pluginDir = __dirname;
     this.apiScriptPath = config.apiScriptPath || path.join(pluginDir, 'philips_air_api.py');
     this.pythonPath = config.pythonPath || this.findPython(pluginDir);
 
+    if (!this.apiScriptPath.endsWith('.py')) {
+      throw new Error(`apiScriptPath must be a .py file: ${this.apiScriptPath}`);
+    }
     if (!fs.existsSync(this.apiScriptPath)) {
       throw new Error(`Python API script not found at: ${this.apiScriptPath}`);
+    }
+    if (config.pythonPath) {
+      this.validatePythonPath(this.pythonPath);
     }
 
     this.log.info(`Using Python: ${this.pythonPath}`);
@@ -256,7 +268,7 @@ class PhilipsAirPurifierAccessory {
     this.lastUpdateTime = 0;
     this.lastPower = null;
     this.lastMode = null;
-    this.commandLock = false;
+    this._commandCount = 0;
     this._restartAttempt = 0;
 
     this.daemon = new DaemonHandler(
@@ -289,6 +301,24 @@ class PhilipsAirPurifierAccessory {
 
     this.log.warn('Could not find Python with aioairctrl installed');
     return 'python3';
+  }
+
+  validateHost(host) {
+    const parts = host.split('.');
+    const valid = parts.length === 4 &&
+      parts.every(p => /^\d{1,3}$/.test(p) && parseInt(p, 10) <= 255);
+    if (!valid) {
+      throw new Error(`host must be a valid IPv4 address, got: "${host}"`);
+    }
+  }
+
+  validatePythonPath(pythonPath) {
+    if (/[;&|`$<>!]/.test(pythonPath)) {
+      throw new Error(`pythonPath contains invalid characters: "${pythonPath}"`);
+    }
+    if (path.isAbsolute(pythonPath) && !fs.existsSync(pythonPath)) {
+      throw new Error(`pythonPath does not exist: "${pythonPath}"`);
+    }
   }
 
   async startDaemon() {
@@ -523,8 +553,12 @@ class PhilipsAirPurifierAccessory {
     return MODE_NAME[mode] || 'auto';
   }
 
+  get commandLock() {
+    return this._commandCount > 0;
+  }
+
   async executeCommand(cmd, args, optimisticState = {}) {
-    this.commandLock = true;
+    this._commandCount++;
     Object.assign(this.state, optimisticState);
     try {
       await this.daemon.execute(cmd, args);
@@ -533,7 +567,7 @@ class PhilipsAirPurifierAccessory {
       this.log.error(`Command ${cmd} failed: ${error.message}`);
       throw new this.api.hap.HapStatusError(this.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     } finally {
-      setTimeout(() => { this.commandLock = false; }, 500);
+      setTimeout(() => { this._commandCount = Math.max(0, this._commandCount - 1); }, 500);
     }
   }
 

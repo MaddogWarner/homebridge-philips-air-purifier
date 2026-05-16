@@ -34,15 +34,6 @@
         "placeholder": "Auto-detected (python3 with aioairctrl)",
         "description": "Path to Python 3 with aioairctrl installed (leave blank for auto-detection)"
       },
-      "pollInterval": {
-        "title": "Poll Interval (ms)",
-        "type": "integer",
-        "required": false,
-        "default": 10000,
-        "minimum": 5000,
-        "maximum": 300000,
-        "description": "How often to poll the device for status updates (in milliseconds, default 10000 = 10 seconds)"
-      }
     }
   },
   "layout": [
@@ -58,7 +49,6 @@
       "expandable": true,
       "expanded": false,
       "items": [
-        "pollInterval",
         {
           "key": "apiScriptPath",
           "description": "Only needed if you want to use a custom Python script location"

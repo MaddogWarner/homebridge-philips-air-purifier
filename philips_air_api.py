@@ -283,6 +283,8 @@ class ObserveDaemon:
         elif cmd == "light":
             if args:
                 level = int(args[0])
+                if not (0 <= level <= 255):
+                    raise ValueError(f"Light level must be 0-255, got {level}")
                 if level == 0:
                     device_value = LIGHT_OFF
                 elif level <= 50 or level == 115:

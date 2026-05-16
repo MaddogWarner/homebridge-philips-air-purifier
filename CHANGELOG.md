@@ -4,6 +4,20 @@ All notable changes to this project will be documented here.
 
 ---
 
+## [2.1.0] - 2026-05-17
+
+### Security
+
+- **Host validation** — `config.host` is now validated as a proper IPv4 address in plugin code (not just the Homebridge UI schema), so hand-edited configs with invalid values are rejected at startup rather than silently passed to the device library.
+- **`pythonPath` validation** — user-supplied `config.pythonPath` is now checked for shell metacharacters (`;`, `&`, `|`, `` ` ``, `$`, `<`, `>`, `!`) and, when an absolute path, must exist on disk before the daemon is started.
+- **`apiScriptPath` validation** — custom script paths must end with `.py`, preventing accidental execution of arbitrary files.
+- **Subprocess environment allowlist** — the Python daemon child process no longer inherits the full Homebridge environment (`...process.env`). Only `PATH`, `HOME`, `LANG`, and `PYTHONUNBUFFERED` are passed, preventing secrets present in environment variables from leaking to the subprocess.
+- **Re-entrant command lock** — `commandLock` was a boolean reset by a `setTimeout`, meaning rapid concurrent HomeKit commands (e.g. from Siri automations) could both enter `executeCommand` simultaneously and race on optimistic state. Replaced with a numeric counter (`_commandCount`) and a `get commandLock()` getter so concurrent commands correctly block the observe-update handler until all have resolved.
+- **Light level bounds check** — the Python daemon now validates that the light level argument is in the range 0–255 before acting on it.
+- **Remove stale `pollInterval` schema field** — `pollInterval` was left in `config.schema.json` from the old polling architecture but has had no effect since v2.0.0 (CoAP Observe replaced polling). Removed to avoid misleading users.
+
+---
+
 ## [2.0.4] - 2026-05-17
 
 ### Added
