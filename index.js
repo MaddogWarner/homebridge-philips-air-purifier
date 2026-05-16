@@ -354,6 +354,7 @@ class PhilipsAirPurifierAccessory {
     this.updateLightCharacteristics();
     this.updateAirQualityCharacteristics();
     this.updateFilterCharacteristics();
+    this.updateSleepCharacteristics();
   }
 
   setupServices() {
@@ -479,11 +480,32 @@ class PhilipsAirPurifierAccessory {
         this.updateLightCharacteristics();
       });
 
+    // Sleep Mode Switch
+    // HomeKit's AirPurifier only has Auto/Manual — Sleep is exposed as a dedicated switch.
+    this.sleepService = new Service.Switch('Sleep Mode', 'sleep-mode');
+    this.sleepService.getCharacteristic(Characteristic.On)
+      .onGet(() => this.state.mode === 'sleep' && this.state.power)
+      .onSet(async (value) => {
+        this.log.info(`[SET] Sleep Mode: ${value ? 'ON' : 'OFF'}`);
+        if (value) {
+          if (!this.state.power) await this.executeCommand('power', ['on'], { power: true });
+          await this.executeCommand('mode', ['sleep'], { mode: 'sleep' });
+          if (this.state.lightLevel > 0) this.lastLightLevel = this.state.lightLevel;
+          await this.executeCommand('light', ['0'], { lightLevel: LIGHT.OFF });
+          this.updateLightCharacteristics();
+        } else {
+          await this.executeCommand('mode', ['auto'], { mode: 'auto' });
+        }
+        this.updatePurifierCharacteristics();
+        this.updateSleepCharacteristics();
+      });
+
     // Link secondary services to primary
     this.purifierService.addLinkedService(this.airQualitySensor);
     this.purifierService.addLinkedService(this.hepaFilterService);
     this.purifierService.addLinkedService(this.preFilterService);
     this.purifierService.addLinkedService(this.lightService);
+    this.purifierService.addLinkedService(this.sleepService);
   }
 
   pm25ToAirQuality(pm25) {
@@ -572,6 +594,11 @@ class PhilipsAirPurifierAccessory {
     );
   }
 
+  updateSleepCharacteristics() {
+    const { Characteristic } = this;
+    this.sleepService.updateCharacteristic(Characteristic.On, this.state.mode === 'sleep' && this.state.power);
+  }
+
   identify() {
     this.log.info(`Identify requested for ${this.name}`);
   }
@@ -584,6 +611,7 @@ class PhilipsAirPurifierAccessory {
       this.hepaFilterService,
       this.preFilterService,
       this.lightService,
+      this.sleepService,
     ];
   }
 }

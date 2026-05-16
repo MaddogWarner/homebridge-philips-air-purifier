@@ -1,6 +1,6 @@
 {
   "name": "@maddogwarner/homebridge-philips-air-purifier",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "description": "Homebridge plugin for Philips Air Purifier with CoAP control",
   "main": "index.js",
   "keywords": [
