@@ -4,6 +4,13 @@ All notable changes to this project will be documented here.
 
 ---
 
+## [2.0.4] - 2026-05-17
+
+### Added
+- `CHANGELOG.md` — full version history added to the repository and npm package.
+
+---
+
 ## [2.0.3] - 2026-05-17
 
 ### Added
