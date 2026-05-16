@@ -1,5 +1,8 @@
 # Homebridge Philips Air Purifier Plugin
 
+> **Forked from [louiscrc/homebridge-philips-air-purifier](https://github.com/louiscrc/homebridge-philips-air-purifier)**
+> Updates in this fork: Homebridge 2.0+ compatibility, Node.js 24 compatibility, daemon auto-restart with backoff, and general code refinements.
+
 Control your Philips Air Purifier with HomeKit via Homebridge.
 
 ## Features
@@ -134,7 +137,9 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Credits
 
-**Author:** [louiscrc](https://github.com/louiscrc)
+**Original author:** [louiscrc](https://github.com/louiscrc) — [louiscrc/homebridge-philips-air-purifier](https://github.com/louiscrc/homebridge-philips-air-purifier)
+
+**Fork maintained by:** [MaddogWarner](https://github.com/MaddogWarner)
 
 Built using:
 
@@ -143,5 +148,5 @@ Built using:
 
 ## Support
 
-- **Issues:** [GitHub Issues](https://github.com/louiscrc/homebridge-philips-air-purifier/issues)
-- **npm Package:** [@louis.crc/homebridge-philips-air-purifier](https://www.npmjs.com/package/@louis.crc/homebridge-philips-air-purifier)
+- **Issues:** [GitHub Issues](https://github.com/MaddogWarner/homebridge-philips-air-purifier/issues)
+- **Original project:** [louiscrc/homebridge-philips-air-purifier](https://github.com/louiscrc/homebridge-philips-air-purifier)

@@ -189,7 +189,7 @@ class ObserveDaemon:
     
     async def _process_commands(self):
         """Process commands from stdin."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         reader = asyncio.StreamReader()
         reader_protocol = asyncio.StreamReaderProtocol(reader)
         await loop.connect_read_pipe(lambda: reader_protocol, sys.stdin)
@@ -328,7 +328,7 @@ class ObserveDaemon:
 async def run_daemon(host: str):
     """Run the observe daemon."""
     daemon = ObserveDaemon(host)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, daemon.shutdown)
