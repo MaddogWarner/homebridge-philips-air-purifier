@@ -49,10 +49,10 @@ You should see a JSON payload with sensor readings. If you get transient errors,
 
 ```bash
 # Install via npm
-npm install -g @louis.crc/homebridge-philips-air-purifier
+npm install -g @maddogwarner/homebridge-philips-air-purifier
 
 # Or install via Homebridge UI:
-# Plugins → Search "@louis.crc/homebridge-philips-air-purifier" → Install
+# Plugins → Search "@maddogwarner/homebridge-philips-air-purifier" → Install
 ```
 
 ### Step 4: Configure Homebridge
