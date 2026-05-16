@@ -1,5 +1,7 @@
 # Homebridge Philips Air Purifier Plugin
 
+[![npm](https://img.shields.io/npm/v/@maddogwarner/homebridge-philips-air-purifier)](https://www.npmjs.com/package/@maddogwarner/homebridge-philips-air-purifier)
+
 > **Forked from [louiscrc/homebridge-philips-air-purifier](https://github.com/louiscrc/homebridge-philips-air-purifier)**
 > Updates in this fork: Homebridge 2.0+ compatibility, Node.js 24 compatibility, daemon auto-restart with backoff, and general code refinements.
 
