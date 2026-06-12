@@ -1,3 +1,9 @@
+> [!WARNING]
+> **This package is deprecated and no longer maintained.**
+> Please migrate to [`homebridge-philips-air-purifier-complete`](https://github.com/MadDogWarner/homebridge-philips-air-purifier-complete), which bundles all Python dependencies, supports Python 3.12+ and Node.js 24, and adds HTTP protocol support for newer Philips devices.
+>
+> Install: `npm install homebridge-philips-air-purifier-complete`
+
 # Homebridge Philips Air Purifier Plugin
 
 [![npm](https://img.shields.io/npm/v/@maddogwarner/homebridge-philips-air-purifier)](https://www.npmjs.com/package/@maddogwarner/homebridge-philips-air-purifier)
